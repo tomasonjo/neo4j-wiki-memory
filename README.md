@@ -11,12 +11,11 @@ backlink-aware knowledge graph instead of a flat log.
 
 | Tool | Purpose |
 |------|---------|
-| `read_memory(path)` | Recall a page. |
+| `read_memory(path, include_backlinks?)` | Recall a page. Pass `include_backlinks=True` to also get every page that links to it. |
 | `write_memory(path, content)` | Save or overwrite a page. Parses `[[wikilinks]]` and auto-creates stub targets. |
 | `append_memory(path, content)` | Append to an existing page (good for logs, timelines). |
 | `list_memories(prefix?, limit?, offset?, sort_by?, order?)` | Browse pages with pagination and sorting. |
 | `search_memory(query, limit?)` | Lucene-style full-text search over paths and content. |
-| `find_memory_backlinks(path)` | Find every page that links to this one. |
 | `rename_memory(old_path, new_path, overwrite?)` | Rename a page and rewrite `[[wikilinks]]` pointing at it. |
 | `delete_memory(path)` | Soft delete (sets `deleted = true`). |
 
@@ -30,7 +29,31 @@ backlink-aware knowledge graph instead of a flat log.
 | `NEO4J_MEMORY_WIKI` | ❌ | `default` | Namespace tag. Use different values to isolate memory sets in one database. |
 
 On first use the server creates a unique constraint on `(:Page {wiki, path})`
-and a fulltext index `page_fulltext` on `(path, content)`.
+and a fulltext index `page_fulltext` on `(path, content)` using the
+`standard-folding` analyzer (case- and accent-insensitive, so `café`
+matches `cafe`). Installs from before v0.2.0 used the default analyzer;
+the server detects the mismatch on startup and recreates the index in
+place.
+
+## Wikilink parsing
+
+- `[[target]]` and `[[target|alias]]` create outbound edges. Aliases
+  are rendered only — the graph edge keys on `target`.
+- Parsing is **context-aware**: `[[...]]` inside fenced code blocks
+  (```` ``` ```` and `~~~`) and inline code spans (`` ` `` or `` `` ``)
+  is ignored.
+- Backslash-escape suppresses parsing: `\[\[foo\]\]` stays literal and
+  creates no edge. Use this whenever documenting wikilink syntax in
+  prose so examples don't stub-spam the graph.
+- Links do not span newlines. Empty `[[]]`, nested `[[[x]]]`, and
+  trailing-slash targets like `[[foo/]]` are rejected. Paths are
+  case-sensitive (`Foo.md` ≠ `foo.md`).
+- `write_memory` replaces a page's outbound edge set. `append_memory`
+  only parses the appended chunk and returns the delta as `added_links`.
+- Linking to a tombstoned (soft-deleted) target creates the edge but
+  does not resurrect the page. The response surfaces those paths under
+  `linked_to_deleted`; only writing at the tombstoned path itself flips
+  the `deleted` flag back.
 
 ## Install & run
 
@@ -128,8 +151,8 @@ log.md                       # scratch / chronological notes
 ```
 
 Cross-link liberally with `[[wikilinks]]` — every edge is something you can
-traverse later via `find_memory_backlinks`. Prefer refining an existing page
-over creating near-duplicates.
+traverse later via `read_memory(path, include_backlinks=True)`. Prefer
+refining an existing page over creating near-duplicates.
 
 ## License
 

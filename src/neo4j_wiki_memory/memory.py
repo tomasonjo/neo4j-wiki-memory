@@ -15,33 +15,115 @@ Env vars (all required to enable these tools):
 from __future__ import annotations
 
 import os
-import re
 from typing import Any
 
 from neo4j import AsyncGraphDatabase, AsyncDriver
-
-WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
 
 _driver: AsyncDriver | None = None
 _schema_ready = False
 WIKI = os.getenv("NEO4J_MEMORY_WIKI", "default")
 
+FULLTEXT_ANALYZER = "standard-folding"
+
 
 def _normalize(target: str) -> str:
+    """Normalize a wikilink target into a canonical page path.
+
+    Returns an empty string for targets that should not produce an edge
+    (empty, all-whitespace, trailing slash). Callers must skip empty
+    results.
+    """
     target = target.strip()
+    if not target or target.endswith("/"):
+        return ""
     if not target.endswith(".md"):
         target += ".md"
     return target
 
 
 def _extract_links(content: str) -> list[str]:
+    """Extract wikilink targets from markdown content.
+
+    Context-aware: skips fenced code blocks (```...``` and ~~~...~~~)
+    and inline code spans (`...`, ``...``). Honors backslash escapes —
+    `\\[`, `\\]`, `` \\` `` and `\\\\` each consume their following
+    character, so `\\[\\[foo\\]\\]` in prose does not create an edge.
+
+    Wikilinks do not span newlines: an unclosed `[[` stops at the next
+    newline and is ignored. Nested `[[` is rejected — `[[[x]]]` yields
+    no link. Alias syntax `[[target|alias]]` is supported; the alias is
+    ignored for graph purposes.
+    """
+    if not content:
+        return []
     seen: set[str] = set()
     out: list[str] = []
-    for m in WIKILINK_RE.finditer(content or ""):
-        t = _normalize(m.group(1))
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
+    i = 0
+    n = len(content)
+    while i < n:
+        c = content[i]
+
+        # Backslash escapes the next character. Consume both so an
+        # escaped `\[` never opens a wikilink.
+        if c == "\\" and i + 1 < n:
+            i += 2
+            continue
+
+        # Fenced code block: ``` ... ``` or ~~~ ... ~~~. Unterminated
+        # fences swallow the rest of the document, mirroring how
+        # markdown renderers treat them.
+        if (c == "`" or c == "~") and content[i : i + 3] == c * 3:
+            fence = c * 3
+            close = content.find(fence, i + 3)
+            if close == -1:
+                break
+            i = close + 3
+            continue
+
+        # Inline code: `...` or ``...``. Matching run lengths.
+        if c == "`":
+            run = 0
+            while i + run < n and content[i + run] == "`":
+                run += 1
+            delim = "`" * run
+            close = content.find(delim, i + run)
+            if close == -1:
+                i += run
+                continue
+            i = close + run
+            continue
+
+        # Wikilink: [[target]] or [[target|alias]].
+        if c == "[" and i + 1 < n and content[i + 1] == "[":
+            j = i + 2
+            end = -1
+            while j < n:
+                ch = content[j]
+                if ch == "\n":
+                    break
+                if ch == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if ch == "[":
+                    break  # bail on nested open
+                if ch == "]":
+                    if j + 1 < n and content[j + 1] == "]":
+                        end = j
+                    break  # lone ] is malformed here
+                j += 1
+            if end == -1:
+                i += 2
+                continue
+            inner = content[i + 2 : end]
+            target_part = inner.split("|", 1)[0]
+            t = _normalize(target_part)
+            if t and t not in seen:
+                seen.add(t)
+                out.append(t)
+            i = end + 2
+            continue
+
+        i += 1
     return out
 
 
@@ -73,9 +155,30 @@ async def _ensure_schema() -> None:
             "CREATE CONSTRAINT page_wiki_path IF NOT EXISTS "
             "FOR (p:Page) REQUIRE (p.wiki, p.path) IS UNIQUE"
         )
+        # Ensure the fulltext index uses the desired analyzer. Accent /
+        # case folding (café ↔ cafe) needs `standard-folding`; the
+        # default `standard` analyzer is accent-sensitive. Existing
+        # installs on the old analyzer are migrated here by drop+recreate.
+        existing = await s.run(
+            "SHOW INDEXES YIELD name, options "
+            "WHERE name = 'page_fulltext' "
+            "RETURN options"
+        )
+        rec = await existing.single()
+        needs_recreate = False
+        if rec is not None:
+            options = rec["options"] or {}
+            index_config = options.get("indexConfig", {}) or {}
+            current = index_config.get("fulltext.analyzer")
+            if current != FULLTEXT_ANALYZER:
+                needs_recreate = True
+        if needs_recreate:
+            await s.run("DROP INDEX page_fulltext IF EXISTS")
         await s.run(
             "CREATE FULLTEXT INDEX page_fulltext IF NOT EXISTS "
-            "FOR (p:Page) ON EACH [p.path, p.content]"
+            "FOR (p:Page) ON EACH [p.path, p.content] "
+            "OPTIONS {indexConfig: {`fulltext.analyzer`: $analyzer}}",
+            analyzer=FULLTEXT_ANALYZER,
         )
     _schema_ready = True
 
@@ -90,19 +193,48 @@ def memory_enabled() -> bool:
 # --- tool implementations ------------------------------------------------
 
 
-async def read_memory(path: str) -> Any:
+async def read_memory(path: str, include_backlinks: bool = False) -> Any:
     """Read a stored memory page from your agentic memory. Use this to recall
     what you've previously learned and saved about a topic, person, or the
     user before answering. Memory persists across sessions — always check
     here for relevant context.
 
+    Pass `include_backlinks=True` to also return the paths of every page
+    that links to this one (inbound `LINKS_TO` edges). Tombstoned sources
+    are filtered out. Useful for seeing where an entity or concept has
+    come up across your memory.
+
     Args:
         path: Memory page path, e.g. "user/profile.md".
+        include_backlinks: If True, include a `backlinks` list in the
+            response with paths of pages linking to this one.
     """
     await _ensure_schema()
     path = _normalize(path)
+    if not path:
+        return {"error": True, "message": "path is empty"}
     driver = await _get_driver()
     async with driver.session() as s:
+        if include_backlinks:
+            result = await s.run(
+                "MATCH (p:Page {wiki: $wiki, path: $path}) "
+                "WHERE coalesce(p.deleted, false) = false "
+                "OPTIONAL MATCH (other:Page {wiki: $wiki})-[:LINKS_TO]->(p) "
+                "  WHERE coalesce(other.deleted, false) = false "
+                "WITH p, other ORDER BY other.path "
+                "RETURN p.content AS content, "
+                "       [x IN collect(other.path) WHERE x IS NOT NULL] AS backlinks",
+                wiki=WIKI,
+                path=path,
+            )
+            record = await result.single()
+            if record is None:
+                return {"error": True, "message": f"Page not found: {path}"}
+            return {
+                "path": path,
+                "content": record["content"] or "",
+                "backlinks": list(record["backlinks"]),
+            }
         result = await s.run(
             "MATCH (p:Page {wiki: $wiki, path: $path}) "
             "WHERE coalesce(p.deleted, false) = false "
@@ -123,6 +255,18 @@ async def write_memory(path: str, content: str) -> Any:
     conversations, decisions made, patterns you've noticed, or any concept
     worth recalling in future sessions. Parses `[[wikilinks]]` from content
     and links to those memories, auto-creating empty stubs as needed.
+
+    The parser is context-aware: `[[...]]` inside fenced code blocks
+    (```` ``` ```` / `~~~`) and inline code spans (`` ` ``, `` `` ``)
+    is ignored, and backslash-escaped brackets (`\\[\\[foo\\]\\]`) are
+    suppressed so examples in prose don't create stubs. Links do not
+    span newlines; empty `[[]]` is rejected.
+
+    Writing a page replaces its content and recomputes its outbound edge
+    set. If any linked target is currently tombstoned (soft-deleted),
+    the response includes `linked_to_deleted` listing those paths — the
+    edges are created, but the target stays deleted until written to
+    directly.
 
     Recommended page layout — organise memories by topic, not by
     conversation, so they can be recalled independently of when they
@@ -167,8 +311,9 @@ async def write_memory(path: str, content: str) -> Any:
     Cross-link liberally with `[[wikilinks]]` — every agent page should
     link to its `[[databases/<dbid>]]`, learnings should link to the
     `[[concepts/...]]` they relate to, and so on. Every link becomes a
-    graph edge you can traverse later via `find_memory_backlinks`.
-    Prefer refining an existing page over creating near-duplicates.
+    graph edge you can traverse later via `read_memory(path,
+    include_backlinks=True)`. Prefer refining an existing page over
+    creating near-duplicates.
 
     Args:
         path: Memory page path, e.g. "user/profile.md".
@@ -176,14 +321,22 @@ async def write_memory(path: str, content: str) -> Any:
     """
     await _ensure_schema()
     path = _normalize(path)
+    if not path:
+        return {"error": True, "message": "path is empty"}
     links = _extract_links(content)
     driver = await _get_driver()
     async with driver.session() as s:
-        await s.execute_write(_write_tx, path, content, links)
-    return {"ok": True, "path": path, "links": links}
+        linked_to_deleted = await s.execute_write(_write_tx, path, content, links)
+    response: dict[str, Any] = {"ok": True, "path": path, "links": links}
+    if linked_to_deleted:
+        # Surface edges created to tombstoned pages. They are real edges
+        # in the graph but the target won't resurrect until someone
+        # writes at its path — the caller needs to know.
+        response["linked_to_deleted"] = linked_to_deleted
+    return response
 
 
-async def _write_tx(tx, path: str, content: str, links: list[str]) -> None:
+async def _write_tx(tx, path: str, content: str, links: list[str]) -> list[str]:
     await tx.run(
         "MERGE (p:Page {wiki: $wiki, path: $path}) "
         "ON CREATE SET p.created_at = datetime() "
@@ -199,26 +352,41 @@ async def _write_tx(tx, path: str, content: str, links: list[str]) -> None:
         wiki=WIKI,
         path=path,
     )
-    if links:
-        await tx.run(
-            "MATCH (p:Page {wiki: $wiki, path: $path}) "
-            "UNWIND $links AS target "
-            "MERGE (t:Page {wiki: $wiki, path: target}) "
-            "ON CREATE SET t.content = '', t.deleted = false, "
-            "              t.size = 0, t.created_at = datetime(), "
-            "              t.updated_at = datetime() "
-            "MERGE (p)-[:LINKS_TO]->(t)",
-            wiki=WIKI,
-            path=path,
-            links=links,
-        )
+    if not links:
+        return []
+    result = await tx.run(
+        "MATCH (p:Page {wiki: $wiki, path: $path}) "
+        "UNWIND $links AS target "
+        "MERGE (t:Page {wiki: $wiki, path: target}) "
+        "ON CREATE SET t.content = '', t.deleted = false, "
+        "              t.size = 0, t.created_at = datetime(), "
+        "              t.updated_at = datetime() "
+        "MERGE (p)-[:LINKS_TO]->(t) "
+        "WITH t WHERE coalesce(t.deleted, false) = true "
+        "RETURN collect(t.path) AS linked_to_deleted",
+        wiki=WIKI,
+        path=path,
+        links=links,
+    )
+    record = await result.single()
+    return list(record["linked_to_deleted"]) if record else []
 
 
 async def append_memory(path: str, content: str) -> Any:
     """Append to an existing memory without rewriting it. Use for running
     logs (`log.md`), timelines on an entity, or accumulating observations
     about the user over time. Adds new links for any wikilinks in the
-    appended text.
+    appended text. Upserts the page if it doesn't exist.
+
+    The parser only scans the appended chunk, so `added_links` is the
+    delta — existing outbound edges are untouched. Same parser rules as
+    `write_memory`: code blocks and backslash-escaped brackets are
+    ignored. If any linked target is tombstoned, the response includes
+    `linked_to_deleted`.
+
+    Not safe to blind-retry on timeout: if the server succeeded but the
+    client never got the response, a retry double-appends. Read the page
+    or check `updated_at` before retrying.
 
     Args:
         path: Memory page path, e.g. "log.md".
@@ -227,6 +395,8 @@ async def append_memory(path: str, content: str) -> Any:
     """
     await _ensure_schema()
     path = _normalize(path)
+    if not path:
+        return {"error": True, "message": "path is empty"}
     links = _extract_links(content)
     driver = await _get_driver()
     async with driver.session() as s:
@@ -250,20 +420,29 @@ async def append_memory(path: str, content: str) -> Any:
             content=content,
         )
         await result.consume()
+        linked_to_deleted: list[str] = []
         if links:
-            await s.run(
+            link_result = await s.run(
                 "MATCH (p:Page {wiki: $wiki, path: $path}) "
                 "UNWIND $links AS target "
                 "MERGE (t:Page {wiki: $wiki, path: target}) "
                 "ON CREATE SET t.content = '', t.deleted = false, "
                 "              t.size = 0, t.created_at = datetime(), "
                 "              t.updated_at = datetime() "
-                "MERGE (p)-[:LINKS_TO]->(t)",
+                "MERGE (p)-[:LINKS_TO]->(t) "
+                "WITH t WHERE coalesce(t.deleted, false) = true "
+                "RETURN collect(t.path) AS linked_to_deleted",
                 wiki=WIKI,
                 path=path,
                 links=links,
             )
-    return {"ok": True, "path": path, "added_links": links}
+            record = await link_result.single()
+            if record:
+                linked_to_deleted = list(record["linked_to_deleted"])
+    response: dict[str, Any] = {"ok": True, "path": path, "added_links": links}
+    if linked_to_deleted:
+        response["linked_to_deleted"] = linked_to_deleted
+    return response
 
 
 _LIST_SORT_FIELDS = {"path", "updated_at", "created_at", "size"}
@@ -407,28 +586,6 @@ async def search_memory(query: str, limit: int = 10) -> Any:
     return {"query": query, "results": hits}
 
 
-async def find_memory_backlinks(path: str) -> Any:
-    """Return all memories that link to this one. Use to find where an
-    entity or concept has come up across your agentic memory.
-
-    Args:
-        path: Memory page path to find backlinks for.
-    """
-    await _ensure_schema()
-    path = _normalize(path)
-    driver = await _get_driver()
-    async with driver.session() as s:
-        result = await s.run(
-            "MATCH (other:Page {wiki: $wiki})-[:LINKS_TO]->(p:Page {wiki: $wiki, path: $path}) "
-            "WHERE coalesce(other.deleted, false) = false "
-            "RETURN other.path AS path ORDER BY other.path",
-            wiki=WIKI,
-            path=path,
-        )
-        backlinks = [r["path"] async for r in result]
-    return {"path": path, "backlinks": backlinks}
-
-
 async def rename_memory(
     old_path: str, new_path: str, overwrite: bool = False
 ) -> Any:
@@ -526,6 +683,14 @@ async def delete_memory(path: str) -> Any:
     """Soft delete a memory. Use when a memory is obsolete or wrong; prefer
     rewriting over deleting when possible so history is preserved.
 
+    Deletion is a flag flip, not a removal. Content, timestamps, and all
+    `LINKS_TO` edges persist. `read`, `list`, and `search` all filter
+    tombstoned pages out. New links from other pages to a tombstoned
+    path still create edges (surfaced via `linked_to_deleted` in
+    write/append responses); only writing at the tombstoned path itself
+    resurrects it. Use `rename_memory` if you want references to move
+    to a live page.
+
     Args:
         path: Memory page path to delete.
     """
@@ -553,6 +718,5 @@ def register(mcp) -> None:
     mcp.tool()(append_memory)
     mcp.tool()(list_memories)
     mcp.tool()(search_memory)
-    mcp.tool()(find_memory_backlinks)
     mcp.tool()(rename_memory)
     mcp.tool()(delete_memory)
