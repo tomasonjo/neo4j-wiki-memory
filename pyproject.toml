@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "neo4j-wiki-memory"
+version = "0.1.0"
+description = "Persistent agent memory backed by Neo4j, exposed as a FastMCP server."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.0.0",
+    "neo4j>=5.0.0",
+]
+
+[project.scripts]
+neo4j-wiki-memory = "neo4j_wiki_memory.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/neo4j_wiki_memory"]
