@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-neo4j-wiki-memory = "neo4j_wiki_memory.server:main"
+neo4j-wiki-memory = "neo4j_wiki_memory:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/neo4j_wiki_memory"]
